@@ -1,8 +1,8 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:math' as math;
 import 'dart:typed_data';
 import 'package:cloud_firestore/cloud_firestore.dart';
-import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_storage/firebase_storage.dart';
 import 'package:flutter/material.dart';
@@ -12,6 +12,25 @@ import 'audio_engine.dart';
 
 class AppState extends ChangeNotifier {
   static const String _storageKey = 'eco_production_state_v2';
+
+  static const FirebaseOptions _firebaseOptions = FirebaseOptions(
+    apiKey: 'AIzaSyATdajvIWiXKSw_PLduCNEYkHQ7hiHbTC8',
+    appId: '1:291762993564:web:d4901f54951de762217059',
+    messagingSenderId: '291762993564',
+    projectId: 'dunyakupasi2026',
+    authDomain: 'dunyakupasi2026.firebaseapp.com',
+    storageBucket: 'dunyakupasi2026.firebasestorage.app',
+    measurementId: 'G-T0D6H3R7YD',
+  );
+
+  // Namespaced collections in Cloud Firestore so everyone sees the same live database
+  static const String _colUsers = 'eco_users';
+  static const String _colTracks = 'eco_tracks';
+  static const String _colComments = 'eco_comments';
+  static const String _colFollows = 'eco_follows';
+  static const String _colMessages = 'eco_messages';
+  static const String _colReports = 'eco_reports';
+  static const String _colBlocks = 'eco_blocks';
 
   final AudioEngine audioEngine = AudioEngine();
 
@@ -35,6 +54,8 @@ class AppState extends ChangeNotifier {
   final Map<String, Uint8List> _uploadedAvatarBytes = {};
   final Map<String, Uint8List> _uploadedVideoBytes = {};
 
+  final List<StreamSubscription> _firestoreSubs = [];
+
   String _selectedGenre = 'Tümü';
   String get selectedGenre => _selectedGenre;
 
@@ -54,7 +75,6 @@ class AppState extends ChangeNotifier {
     'Akustik',
   ];
 
-  /// Kullanıcının profilinde seçebileceği yapılan müzik türleri
   static const List<String> availableMusicStyles = [
     'Cover',
     'Rap',
@@ -70,7 +90,6 @@ class AppState extends ChangeNotifier {
     'Akustik',
   ];
 
-  /// Kullanıcının profilinde seçebileceği iş birliği rolleri
   static const List<String> availableCollabRoles = [
     'Vokal',
     'Beatmaker',
@@ -97,17 +116,156 @@ class AppState extends ChangeNotifier {
   Uint8List? getVideoBytes(String trackId) => _uploadedVideoBytes[trackId];
 
   Future<void> initialize() async {
+    await _loadPersistedState();
+
     try {
       if (Firebase.apps.isEmpty) {
-        await Firebase.initializeApp();
+        await Firebase.initializeApp(options: _firebaseOptions);
       }
       _firebaseAvailable = true;
+      await _syncLocalToFirestoreAndSubscribe();
     } catch (_) {
       _firebaseAvailable = false;
     }
 
-    await _loadPersistedState();
     notifyListeners();
+  }
+
+  /// Mevcut tarayıcıda oluşturulmuş kullanıcı/parça varsa Firestore'a aktarır ve
+  /// tüm koleksiyonları gerçek zamanlı (real-time snapshots) dinlemeye başlar.
+  Future<void> _syncLocalToFirestoreAndSubscribe() async {
+    if (!_firebaseAvailable) return;
+    final db = FirebaseFirestore.instance;
+
+    try {
+      // Push any locally cached users/tracks/comments up to shared Firestore
+      for (final u in _users) {
+        final map = u.toMap();
+        final pass = _credentials[u.email.toLowerCase()];
+        if (pass != null) map['password_plain'] = pass;
+        await db.collection(_colUsers).doc(u.id).set(map, SetOptions(merge: true));
+      }
+      for (final t in _tracks) {
+        await db.collection(_colTracks).doc(t.id).set(t.toMap(), SetOptions(merge: true));
+      }
+      for (final c in _comments) {
+        await db.collection(_colComments).doc(c.id).set(c.toMap(), SetOptions(merge: true));
+      }
+    } catch (_) {}
+
+    // Real-time stream listeners so any device opening the URL sees live updates immediately
+    _firestoreSubs.add(
+      db.collection(_colUsers).snapshots().listen((snap) {
+        final remoteUsers = <AppUser>[];
+        for (final doc in snap.docs) {
+          final data = doc.data();
+          final user = AppUser.fromMap(data);
+          remoteUsers.add(user);
+          if (data['password_plain'] != null) {
+            _credentials[user.email.toLowerCase()] =
+                data['password_plain'].toString();
+          }
+          if (data['avatar_b64'] != null) {
+            try {
+              _uploadedAvatarBytes[user.id] =
+                  base64Decode(data['avatar_b64'].toString());
+            } catch (_) {}
+          }
+        }
+        _users
+          ..clear()
+          ..addAll(remoteUsers);
+        if (_currentUser != null) {
+          _currentUser = getUserById(_currentUser!.id) ?? _currentUser;
+        }
+        _persistState();
+        notifyListeners();
+      }),
+    );
+
+    _firestoreSubs.add(
+      db.collection(_colTracks).snapshots().listen((snap) {
+        final remoteTracks = snap.docs
+            .map((doc) {
+              final data = doc.data();
+              if (data['cover_b64'] != null) {
+                try {
+                  _uploadedCoverBytes[data['id'].toString()] =
+                      base64Decode(data['cover_b64'].toString());
+                } catch (_) {}
+              }
+              return Track.fromMap(data);
+            })
+            .toList();
+        remoteTracks.sort((a, b) => b.createdAt.compareTo(a.createdAt));
+        _tracks
+          ..clear()
+          ..addAll(remoteTracks);
+        _persistState();
+        notifyListeners();
+      }),
+    );
+
+    _firestoreSubs.add(
+      db.collection(_colComments).snapshots().listen((snap) {
+        final remoteComments =
+            snap.docs.map((doc) => TrackComment.fromMap(doc.data())).toList();
+        _comments
+          ..clear()
+          ..addAll(remoteComments);
+        _persistState();
+        notifyListeners();
+      }),
+    );
+
+    _firestoreSubs.add(
+      db.collection(_colFollows).snapshots().listen((snap) {
+        final remoteFollows =
+            snap.docs.map((doc) => FollowRelation.fromMap(doc.data())).toList();
+        _follows
+          ..clear()
+          ..addAll(remoteFollows);
+        _persistState();
+        notifyListeners();
+      }),
+    );
+
+    _firestoreSubs.add(
+      db.collection(_colMessages).snapshots().listen((snap) {
+        final remoteMessages =
+            snap.docs.map((doc) => DirectMessage.fromMap(doc.data())).toList();
+        _messages
+          ..clear()
+          ..addAll(remoteMessages);
+        _persistState();
+        notifyListeners();
+      }),
+    );
+
+    _firestoreSubs.add(
+      db.collection(_colReports).snapshots().listen((snap) {
+        final remoteReports =
+            snap.docs.map((doc) => ContentReport.fromMap(doc.data())).toList();
+        remoteReports.sort((a, b) => b.createdAt.compareTo(a.createdAt));
+        _reports
+          ..clear()
+          ..addAll(remoteReports);
+        _persistState();
+        notifyListeners();
+      }),
+    );
+
+    _firestoreSubs.add(
+      db.collection(_colBlocks).snapshots().listen((snap) {
+        final remoteBlocks =
+            snap.docs.map((doc) => UserBlock.fromMap(doc.data())).toList();
+        _blocks
+          ..clear()
+          ..addAll(remoteBlocks);
+        _persistState();
+        notifyListeners();
+      }),
+    );
   }
 
   Future<void> _loadPersistedState() async {
@@ -228,16 +386,8 @@ class AppState extends ChangeNotifier {
       throw Exception('E-posta ve şifre alanları zorunludur.');
     }
 
-    if (_firebaseAvailable) {
-      try {
-        await FirebaseAuth.instance.signInWithEmailAndPassword(
-          email: normalizedEmail,
-          password: password,
-        );
-      } catch (_) {}
-    }
-
-    if (normalizedEmail == 'admin@eco.fm' || normalizedEmail == 'admin@eco.app') {
+    if (normalizedEmail == 'admin@eco.fm' ||
+        normalizedEmail == 'admin@eco.app') {
       var adminUser = _users.cast<AppUser?>().firstWhere(
             (u) => u!.email.toLowerCase() == normalizedEmail,
             orElse: () => null,
@@ -260,11 +410,42 @@ class AppState extends ChangeNotifier {
           createdAt: DateTime.now(),
         );
         _users.add(adminUser);
+        if (_firebaseAvailable) {
+          try {
+            await FirebaseFirestore.instance
+                .collection(_colUsers)
+                .doc(adminUser.id)
+                .set(adminUser.toMap());
+          } catch (_) {}
+        }
       }
       _currentUser = adminUser;
       await _persistState();
       notifyListeners();
       return;
+    }
+
+    // If Firebase is available, also check Firestore directly in case user signed up on another device
+    if (_firebaseAvailable) {
+      try {
+        final snap = await FirebaseFirestore.instance
+            .collection(_colUsers)
+            .get();
+        for (final doc in snap.docs) {
+          final data = doc.data();
+          final u = AppUser.fromMap(data);
+          final idx = _users.indexWhere((existing) => existing.id == u.id);
+          if (idx >= 0) {
+            _users[idx] = u;
+          } else {
+            _users.add(u);
+          }
+          if (data['password_plain'] != null) {
+            _credentials[u.email.toLowerCase()] =
+                data['password_plain'].toString();
+          }
+        }
+      } catch (_) {}
     }
 
     final existing = _users.cast<AppUser?>().firstWhere(
@@ -275,10 +456,12 @@ class AppState extends ChangeNotifier {
         );
 
     if (existing == null) {
-      throw Exception('Bu e-posta veya kullanıcı adıyla kayıtlı hesap bulunamadı.');
+      throw Exception(
+          'Bu e-posta veya kullanıcı adıyla kayıtlı hesap bulunamadı.');
     }
     if (existing.isSuspended) {
-      throw Exception('Bu hesap kullanım koşulları ihlali nedeniyle askıya alınmıştır.');
+      throw Exception(
+          'Bu hesap kullanım koşulları ihlali nedeniyle askıya alınmıştır.');
     }
 
     final savedPass = _credentials[existing.email.toLowerCase()];
@@ -312,7 +495,8 @@ class AppState extends ChangeNotifier {
         username.trim().toLowerCase().replaceAll(RegExp(r'[^a-z0-9_.]'), '');
 
     if (cleanUsername.isEmpty || cleanEmail.isEmpty || password.length < 4) {
-      throw Exception('Geçerli bir kullanıcı adı, e-posta ve en az 4 karakterli şifre girin.');
+      throw Exception(
+          'Geçerli bir kullanıcı adı, e-posta ve en az 4 karakterli şifre girin.');
     }
 
     final duplicate = _users.any(
@@ -321,23 +505,12 @@ class AppState extends ChangeNotifier {
           u.username.toLowerCase() == cleanUsername,
     );
     if (duplicate) {
-      throw Exception('Bu kullanıcı adı veya e-posta adresi zaten kullanılıyor.');
+      throw Exception(
+          'Bu kullanıcı adı veya e-posta adresi zaten kullanılıyor.');
     }
 
     final now = DateTime.now();
-    String uid = 'usr_${now.millisecondsSinceEpoch}';
-
-    if (_firebaseAvailable) {
-      try {
-        final cred = await FirebaseAuth.instance.createUserWithEmailAndPassword(
-          email: cleanEmail,
-          password: password,
-        );
-        if (cred.user != null) {
-          uid = cred.user!.uid;
-        }
-      } catch (_) {}
-    }
+    final String uid = 'usr_${now.millisecondsSinceEpoch}';
 
     if (avatarBytes != null) {
       _uploadedAvatarBytes[uid] = avatarBytes;
@@ -370,10 +543,15 @@ class AppState extends ChangeNotifier {
 
     if (_firebaseAvailable) {
       try {
+        final userMap = newUser.toMap();
+        userMap['password_plain'] = password;
+        if (avatarBytes != null && avatarBytes.lengthInBytes < 500000) {
+          userMap['avatar_b64'] = base64Encode(avatarBytes);
+        }
         await FirebaseFirestore.instance
-            .collection('users')
+            .collection(_colUsers)
             .doc(newUser.id)
-            .set(newUser.toMap());
+            .set(userMap);
       } catch (_) {}
     }
 
@@ -382,11 +560,6 @@ class AppState extends ChangeNotifier {
   }
 
   Future<void> signOut() async {
-    if (_firebaseAvailable) {
-      try {
-        await FirebaseAuth.instance.signOut();
-      } catch (_) {}
-    }
     await audioEngine.pause();
     _currentUser = null;
     await _persistState();
@@ -451,9 +624,7 @@ class AppState extends ChangeNotifier {
   }
 
   List<Track> tracksForUser(String userId) {
-    return _tracks
-        .where((t) => t.userId == userId && !t.isHidden)
-        .toList();
+    return _tracks.where((t) => t.userId == userId && !t.isHidden).toList();
   }
 
   List<TrackComment> commentsForTrack(String trackId) {
@@ -517,6 +688,19 @@ class AppState extends ChangeNotifier {
         followerCount: math.max(0, target.followerCount - 1),
       );
       _updateUserInList(updatedTarget);
+
+      if (_firebaseAvailable) {
+        try {
+          await FirebaseFirestore.instance
+              .collection(_colFollows)
+              .doc('${me.id}_$targetUserId')
+              .delete();
+          await FirebaseFirestore.instance
+              .collection(_colUsers)
+              .doc(updatedTarget.id)
+              .update({'follower_count': updatedTarget.followerCount});
+        } catch (_) {}
+      }
     } else {
       earnedEarlyBadge = target.followerCount < 100;
       final relation = FollowRelation(
@@ -534,9 +718,13 @@ class AppState extends ChangeNotifier {
       if (_firebaseAvailable) {
         try {
           await FirebaseFirestore.instance
-              .collection('follows')
+              .collection(_colFollows)
               .doc('${me.id}_$targetUserId')
               .set(relation.toMap());
+          await FirebaseFirestore.instance
+              .collection(_colUsers)
+              .doc(updatedTarget.id)
+              .update({'follower_count': updatedTarget.followerCount});
         } catch (_) {}
       }
     }
@@ -553,7 +741,18 @@ class AppState extends ChangeNotifier {
   Future<void> incrementPlayCount(String trackId) async {
     final idx = _tracks.indexWhere((t) => t.id == trackId);
     if (idx < 0) return;
-    _tracks[idx] = _tracks[idx].copyWith(playCount: _tracks[idx].playCount + 1);
+    final newCount = _tracks[idx].playCount + 1;
+    _tracks[idx] = _tracks[idx].copyWith(playCount: newCount);
+
+    if (_firebaseAvailable) {
+      try {
+        await FirebaseFirestore.instance
+            .collection(_colTracks)
+            .doc(trackId)
+            .update({'play_count': newCount});
+      } catch (_) {}
+    }
+
     await _persistState();
     notifyListeners();
   }
@@ -571,6 +770,16 @@ class AppState extends ChangeNotifier {
       likes.add(me.id);
     }
     _tracks[idx] = track.copyWith(likedByUserIds: likes);
+
+    if (_firebaseAvailable) {
+      try {
+        await FirebaseFirestore.instance
+            .collection(_colTracks)
+            .doc(trackId)
+            .update({'liked_by_user_ids': likes});
+      } catch (_) {}
+    }
+
     await _persistState();
     notifyListeners();
   }
@@ -588,6 +797,16 @@ class AppState extends ChangeNotifier {
       saves.add(me.id);
     }
     _tracks[idx] = track.copyWith(savedByUserIds: saves);
+
+    if (_firebaseAvailable) {
+      try {
+        await FirebaseFirestore.instance
+            .collection(_colTracks)
+            .doc(trackId)
+            .update({'saved_by_user_ids': saves});
+      } catch (_) {}
+    }
+
     await _persistState();
     notifyListeners();
   }
@@ -614,7 +833,7 @@ class AppState extends ChangeNotifier {
     if (_firebaseAvailable) {
       try {
         await FirebaseFirestore.instance
-            .collection('comments')
+            .collection(_colComments)
             .doc(comment.id)
             .set(comment.toMap());
       } catch (_) {}
@@ -625,7 +844,7 @@ class AppState extends ChangeNotifier {
   }
 
   // ===========================================================================
-  // TRACK / VIDEO / SOCIAL LINK (YOUTUBE, TIKTOK, INSTAGRAM) UPLOAD
+  // TRACK / VIDEO / SOCIAL LINK UPLOAD (SYNCED TO SHARED FIRESTORE)
   // ===========================================================================
 
   Future<Track> uploadTrack({
@@ -635,13 +854,13 @@ class AppState extends ChangeNotifier {
     required List<String> tags,
     required int durationSec,
     required bool copyrightAccepted,
-    String mediaType = 'audio', // 'audio' | 'video' | 'social_link'
+    String mediaType = 'audio',
     Uint8List? audioBytes,
     String? audioFileName,
     Uint8List? videoBytes,
     String? videoFileName,
     String? videoUrl,
-    String? externalUrl, // YouTube, TikTok, Instagram link
+    String? externalUrl,
     Uint8List? coverBytes,
     String? coverUrlFallback,
   }) async {
@@ -687,20 +906,20 @@ class AppState extends ChangeNotifier {
     if (_firebaseAvailable) {
       try {
         if (audioBytes != null) {
-          final ref = FirebaseStorage.instance
-              .ref('tracks/${me.id}/$trackId/${audioFileName ?? "audio.mp3"}');
+          final ref = FirebaseStorage.instance.ref(
+              'eco_tracks/${me.id}/$trackId/${audioFileName ?? "audio.mp3"}');
           await ref.putData(audioBytes);
           resolvedAudioUrl = await ref.getDownloadURL();
         }
         if (videoBytes != null) {
-          final ref = FirebaseStorage.instance
-              .ref('tracks/${me.id}/$trackId/${videoFileName ?? "video.mp4"}');
+          final ref = FirebaseStorage.instance.ref(
+              'eco_tracks/${me.id}/$trackId/${videoFileName ?? "video.mp4"}');
           await ref.putData(videoBytes);
           resolvedVideoUrl = await ref.getDownloadURL();
         }
         if (coverBytes != null) {
           final ref = FirebaseStorage.instance
-              .ref('tracks/${me.id}/$trackId/cover.jpg');
+              .ref('eco_tracks/${me.id}/$trackId/cover.jpg');
           await ref.putData(coverBytes);
           resolvedCoverUrl = await ref.getDownloadURL();
         }
@@ -737,14 +956,26 @@ class AppState extends ChangeNotifier {
       final updatedMe = me.copyWith(pinnedTrackId: newTrack.id);
       _updateUserInList(updatedMe);
       _currentUser = updatedMe;
+      if (_firebaseAvailable) {
+        try {
+          await FirebaseFirestore.instance
+              .collection(_colUsers)
+              .doc(updatedMe.id)
+              .update({'pinned_track_id': newTrack.id});
+        } catch (_) {}
+      }
     }
 
     if (_firebaseAvailable) {
       try {
+        final trackMap = newTrack.toMap();
+        if (coverBytes != null && coverBytes.lengthInBytes < 600000) {
+          trackMap['cover_b64'] = base64Encode(coverBytes);
+        }
         await FirebaseFirestore.instance
-            .collection('tracks')
+            .collection(_colTracks)
             .doc(newTrack.id)
-            .set(newTrack.toMap());
+            .set(trackMap);
       } catch (_) {}
     }
 
@@ -789,10 +1020,14 @@ class AppState extends ChangeNotifier {
 
     if (_firebaseAvailable) {
       try {
+        final updateMap = updated.toMap();
+        if (avatarBytes != null && avatarBytes.lengthInBytes < 500000) {
+          updateMap['avatar_b64'] = base64Encode(avatarBytes);
+        }
         await FirebaseFirestore.instance
-            .collection('users')
+            .collection(_colUsers)
             .doc(updated.id)
-            .update(updated.toMap());
+            .set(updateMap, SetOptions(merge: true));
       } catch (_) {}
     }
 
@@ -880,7 +1115,7 @@ class AppState extends ChangeNotifier {
     if (_firebaseAvailable) {
       try {
         await FirebaseFirestore.instance
-            .collection('messages')
+            .collection(_colMessages)
             .doc(msg.id)
             .set(msg.toMap());
       } catch (_) {}
@@ -923,7 +1158,7 @@ class AppState extends ChangeNotifier {
     if (_firebaseAvailable) {
       try {
         await FirebaseFirestore.instance
-            .collection('reports')
+            .collection(_colReports)
             .doc(report.id)
             .set(report.toMap());
       } catch (_) {}
@@ -953,7 +1188,7 @@ class AppState extends ChangeNotifier {
       if (_firebaseAvailable) {
         try {
           await FirebaseFirestore.instance
-              .collection('blocks')
+              .collection(_colBlocks)
               .doc('${me.id}_$blockedUserId')
               .set(block.toMap());
         } catch (_) {}
@@ -970,6 +1205,14 @@ class AppState extends ChangeNotifier {
     _blocks.removeWhere(
       (b) => b.blockerId == me.id && b.blockedId == blockedUserId,
     );
+    if (_firebaseAvailable) {
+      try {
+        await FirebaseFirestore.instance
+            .collection(_colBlocks)
+            .doc('${me.id}_$blockedUserId')
+            .delete();
+      } catch (_) {}
+    }
     await _persistState();
     notifyListeners();
   }
@@ -984,24 +1227,49 @@ class AppState extends ChangeNotifier {
         if (audioEngine.activeTrackId == report.targetId) {
           await audioEngine.pause();
         }
+        if (_firebaseAvailable) {
+          try {
+            await FirebaseFirestore.instance
+                .collection(_colTracks)
+                .doc(report.targetId)
+                .update({'is_hidden': true});
+          } catch (_) {}
+        }
       }
     } else if (report.targetType == 'comment') {
       final idx = _comments.indexWhere((c) => c.id == report.targetId);
       if (idx >= 0) {
         _comments[idx] = _comments[idx].copyWith(isHidden: true);
+        if (_firebaseAvailable) {
+          try {
+            await FirebaseFirestore.instance
+                .collection(_colComments)
+                .doc(report.targetId)
+                .update({'is_hidden': true});
+          } catch (_) {}
+        }
       }
     }
 
     final repIdx = _reports.indexWhere((r) => r.id == report.id);
     if (repIdx >= 0) {
       _reports[repIdx] = _reports[repIdx].copyWith(status: 'resolved');
+      if (_firebaseAvailable) {
+        try {
+          await FirebaseFirestore.instance
+              .collection(_colReports)
+              .doc(report.id)
+              .update({'status': 'resolved'});
+        } catch (_) {}
+      }
     }
 
     await _persistState();
     notifyListeners();
   }
 
-  Future<void> adminSuspendUser(String targetUserId, {String? relatedReportId}) async {
+  Future<void> adminSuspendUser(String targetUserId,
+      {String? relatedReportId}) async {
     if (_currentUser?.isAdmin != true) return;
     final target = getUserById(targetUserId);
     if (target == null) return;
@@ -1009,10 +1277,27 @@ class AppState extends ChangeNotifier {
     final updatedUser = target.copyWith(isSuspended: !target.isSuspended);
     _updateUserInList(updatedUser);
 
+    if (_firebaseAvailable) {
+      try {
+        await FirebaseFirestore.instance
+            .collection(_colUsers)
+            .doc(targetUserId)
+            .update({'is_suspended': updatedUser.isSuspended});
+      } catch (_) {}
+    }
+
     if (relatedReportId != null) {
       final repIdx = _reports.indexWhere((r) => r.id == relatedReportId);
       if (repIdx >= 0) {
         _reports[repIdx] = _reports[repIdx].copyWith(status: 'resolved');
+        if (_firebaseAvailable) {
+          try {
+            await FirebaseFirestore.instance
+                .collection(_colReports)
+                .doc(relatedReportId)
+                .update({'status': 'resolved'});
+          } catch (_) {}
+        }
       }
     }
 
@@ -1024,8 +1309,28 @@ class AppState extends ChangeNotifier {
     if (_currentUser?.isAdmin != true) return;
     final idx = _tracks.indexWhere((t) => t.id == trackId);
     if (idx < 0) return;
-    _tracks[idx] = _tracks[idx].copyWith(isHidden: !_tracks[idx].isHidden);
+    final newHidden = !_tracks[idx].isHidden;
+    _tracks[idx] = _tracks[idx].copyWith(isHidden: newHidden);
+
+    if (_firebaseAvailable) {
+      try {
+        await FirebaseFirestore.instance
+            .collection(_colTracks)
+            .doc(trackId)
+            .update({'is_hidden': newHidden});
+      } catch (_) {}
+    }
+
     await _persistState();
     notifyListeners();
+  }
+
+  @override
+  void dispose() {
+    for (final s in _firestoreSubs) {
+      s.cancel();
+    }
+    audioEngine.dispose();
+    super.dispose();
   }
 }
