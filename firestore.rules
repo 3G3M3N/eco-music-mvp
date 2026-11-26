@@ -1,0 +1,65 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isAdmin() {
+      return isSignedIn() &&
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin';
+    }
+
+    // users: id, username, email, avatar_url, bio, theme_gradient, is_open_to_collab, roles[], pinned_track_id, follower_count, role (user/admin), is_suspended, terms_accepted_at, created_at
+    match /users/{userId} {
+      allow read: if true;
+      allow create: if isSignedIn() && request.auth.uid == userId;
+      allow update: if (isSignedIn() && request.auth.uid == userId) || isAdmin();
+      allow delete: if isAdmin();
+    }
+
+    // tracks: id, user_id, title, audio_url, cover_url, genre, tags[], duration, play_count, copyright_accepted_at, is_hidden, created_at
+    match /tracks/{trackId} {
+      allow read: if resource.data.is_hidden == false || isAdmin() || (isSignedIn() && resource.data.user_id == request.auth.uid);
+      allow create: if isSignedIn()
+        && request.resource.data.user_id == request.auth.uid
+        && request.resource.data.copyright_accepted_at != null;
+      allow update: if (isSignedIn() && resource.data.user_id == request.auth.uid) || isAdmin();
+      allow delete: if isAdmin() || (isSignedIn() && resource.data.user_id == request.auth.uid);
+    }
+
+    // comments: id, track_id, user_id, content, timestamp_sec, is_hidden, created_at
+    match /comments/{commentId} {
+      allow read: if true;
+      allow create: if isSignedIn() && request.resource.data.user_id == request.auth.uid;
+      allow update, delete: if (isSignedIn() && resource.data.user_id == request.auth.uid) || isAdmin();
+    }
+
+    // follows: follower_id, following_id, is_early_supporter (boolean), created_at
+    match /follows/{followId} {
+      allow read: if true;
+      allow create: if isSignedIn() && request.resource.data.follower_id == request.auth.uid;
+      allow delete: if isSignedIn() && resource.data.follower_id == request.auth.uid;
+    }
+
+    // messages: id, sender_id, receiver_id, content, is_collab_request (boolean), created_at
+    match /messages/{messageId} {
+      allow read: if isSignedIn() && (resource.data.sender_id == request.auth.uid || resource.data.receiver_id == request.auth.uid);
+      allow create: if isSignedIn() && request.resource.data.sender_id == request.auth.uid;
+    }
+
+    // reports: id, reporter_id, target_type (track/comment/user), target_id, reason, status (pending/resolved), created_at
+    match /reports/{reportId} {
+      allow read: if isAdmin() || (isSignedIn() && resource.data.reporter_id == request.auth.uid);
+      allow create: if isSignedIn() && request.resource.data.reporter_id == request.auth.uid;
+      allow update, delete: if isAdmin();
+    }
+
+    // blocks: blocker_id, blocked_id, created_at
+    match /blocks/{blockId} {
+      allow read: if isSignedIn() && resource.data.blocker_id == request.auth.uid;
+      allow create: if isSignedIn() && request.resource.data.blocker_id == request.auth.uid;
+      allow delete: if isSignedIn() && resource.data.blocker_id == request.auth.uid;
+    }
+  }
+}
